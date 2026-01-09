@@ -1,0 +1,525 @@
+import express from "express";
+import { Pool } from "pg";
+import dotenv from "dotenv";
+import admin from "firebase-admin";
+
+dotenv.config();
+
+const app = express();
+app.use(express.json());
+
+// 1. INITIALIZE FIREBASE ADMIN USING ENV VARIABLE
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: `https://${serviceAccount.project_id}.firebaseio.com`
+});
+
+// 2. CONNECT TO POSTGRES
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+});
+
+// Initialize Tables
+const initDB = async () => {
+    const client = await pool.connect();
+    try {
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS territories (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id VARCHAR(255) NOT NULL,
+                geom GEOMETRY(Polygon, 4326) NOT NULL,
+                area_m2 FLOAT NOT NULL,
+                metadata JSONB,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS territories_geom_idx ON territories USING GIST (geom);
+            CREATE INDEX IF NOT EXISTS territories_user_idx ON territories (user_id);
+
+            CREATE TABLE IF NOT EXISTS world_territories (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id VARCHAR(255) NOT NULL,
+                geom GEOMETRY(Polygon, 4326) NOT NULL,
+                area_m2 FLOAT NOT NULL,
+                metadata JSONB,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS world_territories_geom_idx ON world_territories USING GIST (geom);
+            CREATE INDEX IF NOT EXISTS world_territories_user_idx ON world_territories (user_id);
+        `);
+        console.log("Database tables initialized");
+    } catch (err) {
+        console.error("Error initializing DB:", err);
+    } finally {
+        client.release();
+    }
+};
+initDB();
+
+// 3. HEALTH CHECK - TEST POSTGRES CONNECTION
+app.get("/health", async (req, res) => {
+    try {
+        const result = await pool.query("SELECT NOW()");
+        res.json({ ok: true, db_time: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+// 4. VERIFY TOKEN - TEST FIREBASE AUTH
+app.post("/verify-token", async (req, res) => {
+    const token = req.headers.authorization?.split("Bearer ")[1];
+
+    if (!token) {
+        return res.status(400).json({ ok: false, error: "Missing Authorization header" });
+    }
+
+    try {
+        const decoded = await admin.auth().verifyIdToken(token);
+        res.json({ ok: true, uid: decoded.uid, email: decoded.email });
+    } catch (err) {
+        res.status(401).json({ ok: false, error: err.message });
+    }
+});
+
+app.post("/territories/create", async (req, res) => {
+    console.log("\n=== /territories/create called ===");
+    const client = await pool.connect();
+
+    try {
+        // STEP 1: Verify Firebase token
+        const token = req.headers.authorization?.split("Bearer ")[1];
+        if (!token) return res.status(401).json({ ok: false, error: "Missing token" });
+
+        const decoded = await admin.auth().verifyIdToken(token);
+        const uid = decoded.uid;
+
+        // STEP 2: Validate body
+        const { path, runId } = req.body;
+        if (!Array.isArray(path) || path.length < 4) {
+            return res.status(400).json({ ok: false, error: "Invalid path" });
+        }
+
+        // STEP 3: Ensure polygon is closed
+        const coords = path.map((p) => [p.lng, p.lat]);
+        if (coords[0][0] !== coords[coords.length - 1][0] ||
+            coords[0][1] !== coords[coords.length - 1][1]) {
+            coords.push(coords[0]);
+        }
+
+        const newGeoJSON = {
+            type: "Polygon",
+            coordinates: [coords],
+        };
+
+        await client.query("BEGIN");
+
+        // STEP 4: Find overlapping territories
+        const overlapping = await client.query(
+            `
+            SELECT id, ST_AsGeoJSON(geom) as geom
+            FROM territories
+            WHERE user_id = $1
+              AND ST_Intersects(geom, ST_SetSRID(ST_GeomFromGeoJSON($2), 4326));
+            `,
+            [uid, JSON.stringify(newGeoJSON)]
+        );
+
+        let mergedGeom;
+
+        if (overlapping.rows.length === 0) {
+            // No overlaps - make sure geometry is valid
+            mergedGeom = `ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON('${JSON.stringify(newGeoJSON)}'), 4326))`;
+        } else {
+            // Merge overlaps
+            const geomArraySQL = overlapping.rows
+                .map(row => `ST_SetSRID(ST_GeomFromGeoJSON('${row.geom}'), 4326)`)
+                .join(",");
+
+            mergedGeom = `
+                ST_MakeValid(ST_Union(ARRAY[
+                    ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON('${JSON.stringify(newGeoJSON)}'), 4326)),
+                    ${geomArraySQL}
+                ]))
+            `;
+
+            // Delete old territories
+            const ids = overlapping.rows.map(r => r.id);
+            await client.query(
+                `DELETE FROM territories WHERE id = ANY($1::uuid[])`,
+                [ids]
+            );
+        }
+
+        // STEP 5: Insert merged polygon
+        const insertSQL = `
+            INSERT INTO territories (user_id, geom, area_m2, metadata)
+            VALUES (
+                $1,
+                ${mergedGeom},
+                ST_Area((${mergedGeom})::geography),
+                $2
+            )
+            RETURNING id, area_m2;
+        `;
+
+        const result = await client.query(insertSQL, [
+            uid,
+            { runId }
+        ]);
+
+        // --- WORLD TERRITORY LOGIC (TURF WAR) ---
+        // 1. Subtract this new run from EVERYONE ELSE'S world territories
+        await client.query(`
+            UPDATE world_territories
+            SET geom = ST_Difference(geom, ST_SetSRID(ST_GeomFromGeoJSON($1), 4326))
+            WHERE user_id != $2
+              AND ST_Intersects(geom, ST_SetSRID(ST_GeomFromGeoJSON($1), 4326));
+        `, [JSON.stringify(newGeoJSON), uid]);
+
+        // 2. Remove any world territories that became empty/invalid
+        await client.query(`
+            DELETE FROM world_territories 
+            WHERE ST_IsEmpty(geom) OR ST_Area(geom::geography) < 1;
+        `);
+
+        // 3. Merge with OWN existing world territories
+        const worldOverlapping = await client.query(
+            `
+            SELECT id, ST_AsGeoJSON(geom) as geom
+            FROM world_territories
+            WHERE user_id = $1
+              AND ST_Intersects(geom, ST_SetSRID(ST_GeomFromGeoJSON($2), 4326));
+            `,
+            [uid, JSON.stringify(newGeoJSON)]
+        );
+
+        let worldMergedGeom;
+        if (worldOverlapping.rows.length === 0) {
+            worldMergedGeom = `ST_SetSRID(ST_GeomFromGeoJSON('${JSON.stringify(newGeoJSON)}'), 4326)`;
+        } else {
+            const geomArraySQL = worldOverlapping.rows
+                .map(row => `ST_SetSRID(ST_GeomFromGeoJSON('${row.geom}'), 4326)`)
+                .join(",");
+            worldMergedGeom = `
+                ST_Union(ARRAY[
+                    ST_SetSRID(ST_GeomFromGeoJSON('${JSON.stringify(newGeoJSON)}'), 4326),
+                    ${geomArraySQL}
+                ])
+            `;
+            // Delete old own territories
+            const ids = worldOverlapping.rows.map(r => r.id);
+            await client.query(`DELETE FROM world_territories WHERE id = ANY($1::uuid[])`, [ids]);
+        }
+
+        // 4. Insert new merged world territory
+        await client.query(`
+            INSERT INTO world_territories (user_id, geom, area_m2, metadata)
+            VALUES (
+                $1,
+                ${worldMergedGeom},
+                ST_Area((${worldMergedGeom})::geography),
+                $2
+            )
+        `, [uid, { runId }]);
+        // ----------------------------------------
+
+        await client.query("COMMIT");
+
+        return res.json({
+            ok: true,
+            territoryId: result.rows[0].id,
+            area_m2: result.rows[0].area_m2,
+            merged_count: overlapping.rows.length
+        });
+
+    } catch (err) {
+        await client.query("ROLLBACK");
+        console.error("Error:", err);
+        return res.status(500).json({ ok: false, error: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// Create territory from existing Firebase run ID
+app.post("/territories/create-from-run", async (req, res) => {
+    console.log("\n=== Territory Creation Request ===");
+    const client = await pool.connect();
+
+    try {
+        // STEP 1: Verify Firebase token
+        const token = req.headers.authorization?.split("Bearer ")[1];
+        if (!token) return res.status(401).json({ ok: false, error: "Missing token" });
+
+        const decoded = await admin.auth().verifyIdToken(token);
+        const uid = decoded.uid;
+
+        // STEP 2: Get run ID
+        const { runId } = req.body;
+        if (!runId) return res.status(400).json({ ok: false, error: "Missing runId" });
+
+        // STEP 3: Fetch run
+        const db = admin.firestore();
+        const runDoc = await db.collection('runs').doc(runId).get();
+        if (!runDoc.exists) return res.status(404).json({ ok: false, error: "Run not found" });
+
+        const runData = runDoc.data();
+        if (!runData.path || !Array.isArray(runData.path) || runData.path.length < 4) {
+            return res.status(400).json({ ok: false, error: "Run has no valid path data" });
+        }
+
+        // STEP 4: Normalize path
+        const path = runData.path.map(point => ({
+            lat: point.lat || point.latitude,
+            lng: point.lng || point.longitude
+        }));
+
+        // STEP 5: Ensure polygon is closed
+        const coords = path.map((p) => [p.lng, p.lat]);
+        if (coords[0][0] !== coords[coords.length - 1][0] ||
+            coords[0][1] !== coords[coords.length - 1][1]) {
+            coords.push(coords[0]);
+        }
+
+        const newGeoJSON = {
+            type: "Polygon",
+            coordinates: [coords],
+        };
+
+        await client.query("BEGIN");
+
+        // STEP 6: Find overlapping
+        const overlapping = await client.query(
+            `
+            SELECT id, ST_AsGeoJSON(geom) as geom
+            FROM territories
+            WHERE user_id = $1
+              AND ST_Intersects(geom, ST_SetSRID(ST_GeomFromGeoJSON($2), 4326));
+            `,
+            [uid, JSON.stringify(newGeoJSON)]
+        );
+
+        let mergedGeom;
+
+        if (overlapping.rows.length === 0) {
+            mergedGeom = `ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON('${JSON.stringify(newGeoJSON)}'), 4326))`;
+        } else {
+            const geomArraySQL = overlapping.rows
+                .map(row => `ST_SetSRID(ST_GeomFromGeoJSON('${row.geom}'), 4326)`)
+                .join(",");
+
+            mergedGeom = `
+                ST_Union(ARRAY[
+                    ST_SetSRID(ST_GeomFromGeoJSON('${JSON.stringify(newGeoJSON)}'), 4326),
+                    ${geomArraySQL}
+                ])
+            `;
+
+            const ids = overlapping.rows.map(r => r.id);
+            await client.query(
+                `DELETE FROM territories WHERE id = ANY($1::uuid[])`,
+                [ids]
+            );
+        }
+
+        // STEP 7: Insert merged
+        const insertSQL = `
+            INSERT INTO territories (user_id, geom, area_m2, metadata)
+            VALUES (
+                $1,
+                ${mergedGeom},
+                ST_Area((${mergedGeom})::geography),
+                $2
+            )
+            RETURNING id, area_m2;
+        `;
+
+        const metadata = {
+            runId,
+            distance: runData.distance,
+            duration: runData.duration,
+            createdAt: runData.createdAt
+        };
+
+        const result = await client.query(insertSQL, [
+            uid,
+            metadata
+        ]);
+
+        // --- WORLD TERRITORY LOGIC (TURF WAR) ---
+        // 1. Subtract this new run from EVERYONE ELSE'S world territories
+        await client.query(`
+            UPDATE world_territories
+            SET geom = ST_Difference(geom, ST_SetSRID(ST_GeomFromGeoJSON($1), 4326))
+            WHERE user_id != $2
+              AND ST_Intersects(geom, ST_SetSRID(ST_GeomFromGeoJSON($1), 4326));
+        `, [JSON.stringify(newGeoJSON), uid]);
+
+        // 2. Remove any world territories that became empty/invalid
+        await client.query(`
+            DELETE FROM world_territories 
+            WHERE ST_IsEmpty(geom) OR ST_Area(geom::geography) < 1;
+        `);
+
+        // 3. Merge with OWN existing world territories
+        const worldOverlapping = await client.query(
+            `
+            SELECT id, ST_AsGeoJSON(geom) as geom
+            FROM world_territories
+            WHERE user_id = $1
+              AND ST_Intersects(geom, ST_SetSRID(ST_GeomFromGeoJSON($2), 4326));
+            `,
+            [uid, JSON.stringify(newGeoJSON)]
+        );
+
+        let worldMergedGeom;
+        if (worldOverlapping.rows.length === 0) {
+            worldMergedGeom = `ST_SetSRID(ST_GeomFromGeoJSON('${JSON.stringify(newGeoJSON)}'), 4326)`;
+        } else {
+            const geomArraySQL = worldOverlapping.rows
+                .map(row => `ST_SetSRID(ST_GeomFromGeoJSON('${row.geom}'), 4326)`)
+                .join(",");
+            worldMergedGeom = `
+                ST_Union(ARRAY[
+                    ST_SetSRID(ST_GeomFromGeoJSON('${JSON.stringify(newGeoJSON)}'), 4326),
+                    ${geomArraySQL}
+                ])
+            `;
+            // Delete old own territories
+            const ids = worldOverlapping.rows.map(r => r.id);
+            await client.query(`DELETE FROM world_territories WHERE id = ANY($1::uuid[])`, [ids]);
+        }
+
+        // 4. Insert new merged world territory
+        await client.query(`
+            INSERT INTO world_territories (user_id, geom, area_m2, metadata)
+            VALUES (
+                $1,
+                ${worldMergedGeom},
+                ST_Area((${worldMergedGeom})::geography),
+                $2
+            )
+        `, [uid, metadata]);
+        // ----------------------------------------
+
+        await client.query("COMMIT");
+
+        return res.json({
+            ok: true,
+            territoryId: result.rows[0].id,
+            area_m2: result.rows[0].area_m2,
+            merged_count: overlapping.rows.length
+        });
+
+    } catch (err) {
+        await client.query("ROLLBACK");
+        console.error("Error:", err);
+        return res.status(500).json({ ok: false, error: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// Get all territories for a user
+app.get("/territories/user/:userId", async (req, res) => {
+    try {
+        const { userId } = req.params;
+
+        // Verify token
+        const token = req.headers.authorization?.split("Bearer ")[1];
+        if (!token) return res.status(401).json({ ok: false, error: "Missing token" });
+
+        const decoded = await admin.auth().verifyIdToken(token);
+        if (decoded.uid !== userId) {
+            return res.status(403).json({ ok: false, error: "Unauthorized access to user territories" });
+        }
+
+        const query = `
+            SELECT 
+                id, 
+                ST_AsGeoJSON(geom) as geojson, 
+                area_m2, 
+                metadata,
+                created_at
+            FROM territories 
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+        `;
+
+        const result = await pool.query(query, [userId]);
+
+        const territories = result.rows.map(row => ({
+            id: row.id,
+            geojson: JSON.parse(row.geojson),
+            area_m2: row.area_m2,
+            metadata: row.metadata,
+            createdAt: row.created_at
+        }));
+
+        return res.json({
+            ok: true,
+            territories
+        });
+
+    } catch (err) {
+        console.error("Error fetching territories:", err);
+        return res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+// Get world territories for a list of users
+app.post("/territories/world/list", async (req, res) => {
+    try {
+        const { userIds } = req.body;
+        if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+            return res.json({ ok: true, territories: [] });
+        }
+
+        // Verify token (any authenticated user can view)
+        const token = req.headers.authorization?.split("Bearer ")[1];
+        if (!token) return res.status(401).json({ ok: false, error: "Missing token" });
+        await admin.auth().verifyIdToken(token);
+
+        const query = `
+            SELECT 
+                id, 
+                user_id,
+                ST_AsGeoJSON(geom) as geojson, 
+                area_m2, 
+                metadata,
+                created_at
+            FROM world_territories 
+            WHERE user_id = ANY($1::text[])
+            ORDER BY area_m2 DESC
+        `;
+
+        const result = await pool.query(query, [userIds]);
+
+        const territories = result.rows.map(row => ({
+            id: row.id,
+            userId: row.user_id,
+            geojson: JSON.parse(row.geojson),
+            area_m2: row.area_m2,
+            metadata: row.metadata,
+            createdAt: row.created_at
+        }));
+
+        return res.json({
+            ok: true,
+            territories
+        });
+
+    } catch (err) {
+        console.error("Error fetching world territories:", err);
+        return res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+
+// 5. START SERVER
+app.listen(process.env.PORT || 8080, () => {
+    console.log("Territory API running on port", process.env.PORT || 8080);
+});
