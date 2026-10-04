@@ -7,7 +7,7 @@ class TerritoryService {
   // Find it with: ifconfig (Mac/Linux) or ipconfig (Windows)
   // Example: 'http://192.168.1.100:8080'
   // For emulator/Chrome: use 'http://localhost:8080'
-  static const String baseUrl = 'https://runrealm-api-575506408098.us-central1.run.app';
+  static const String baseUrl = 'https://runrealm-api-781857862718.us-central1.run.app';
   //static const String baseUrl = 'http://192.168.31.123:8080';
   
   
@@ -158,7 +158,7 @@ class TerritoryService {
     }
   }
   /// Fetches territories for a specific group of users (Dynamic Context)
-  static Future<Map<String, dynamic>?> fetchContextTerritories(List<String> userIds) async {
+  static Future<Map<String, dynamic>?> fetchContextTerritories(List<String> userIds, {String? groupId}) async {
     try {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null) return null;
@@ -174,6 +174,7 @@ class TerritoryService {
         },
         body: jsonEncode({
           'userIds': userIds,
+          if (groupId != null) 'groupId': groupId,
         }),
       );
 
