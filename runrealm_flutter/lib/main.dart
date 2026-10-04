@@ -13,6 +13,7 @@ import 'screens/feed_screen.dart';
 import 'screens/setup_screen.dart';
 import 'screens/territory_screen.dart';
 import 'screens/create_group_screen.dart';
+import 'screens/login_screen.dart';
 import 'theme/futuristic_theme.dart';
 
 import 'package:flutter_dotenv/flutter_dotenv.dart';
@@ -48,13 +49,18 @@ class MyApp extends StatelessWidget {
           ],
         ),
         GoRoute(path: '/setup', builder: (context, state) => SetupScreen()),
+        GoRoute(path: '/login', builder: (context, state) => LoginScreen()),
       ],
       redirect: (context, state) {
         if (!authProvider.authReady) return null;
         if (authProvider.user == null) {
-          authProvider.signInAnonymously();
-          return null;
+          if (state.matchedLocation == '/login') return null;
+          return '/login';
         }
+        
+        // If a user is logged in, but tries to go to login screen, redirect home
+        if (state.matchedLocation == '/login') return '/';
+        
         if (!authProvider.profileReady) return null;
         if (authProvider.setupComplete == false) return '/setup';
         
