@@ -5,11 +5,15 @@ import admin from "firebase-admin";
 
 dotenv.config();
 
+import fs from 'fs';
+
+dotenv.config();
+
 const app = express();
 app.use(express.json());
 
-// 1. INITIALIZE FIREBASE ADMIN USING ENV VARIABLE
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+// 1. INITIALIZE FIREBASE ADMIN USING LOCAL FILE
+const serviceAccount = JSON.parse(fs.readFileSync('./service-account.json', 'utf8'));
 
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
@@ -48,6 +52,14 @@ const initDB = async () => {
             );
             CREATE INDEX IF NOT EXISTS world_territories_geom_idx ON world_territories USING GIST (geom);
             CREATE INDEX IF NOT EXISTS world_territories_user_idx ON world_territories (user_id);
+
+            CREATE TABLE IF NOT EXISTS group_leaderboards (
+                group_id VARCHAR(255) NOT NULL,
+                user_id VARCHAR(255) NOT NULL,
+                visible_area_m2 FLOAT NOT NULL,
+                last_updated TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (group_id, user_id)
+            );
         `);
         console.log("Database tables initialized");
     } catch (err) {
@@ -57,6 +69,81 @@ const initDB = async () => {
     }
 };
 initDB();
+
+/**
+ * Recalculates the leaderboard for a specific group using the "Painter's Algorithm".
+ * Stores the result in `group_leaderboards`.
+ */
+const recalculateGroupLeaderboard = async (client, groupId, memberIds) => {
+    if (!groupId || !memberIds || memberIds.length === 0) return;
+
+    console.log(`Recalculating leaderboard for Group: ${groupId}, Members: ${memberIds.length}`);
+
+    // Fetch raw geometries (simplified) for all members
+    const queryRaw = `
+        SELECT 
+            user_id, 
+            ST_AsGeoJSON(ST_Simplify(geom, 0.0001)) as geojson, 
+            created_at 
+        FROM territories 
+        WHERE user_id = ANY($1::text[])
+        ORDER BY created_at ASC
+    `;
+    const resultRaw = await client.query(queryRaw, [memberIds]);
+
+    // If no territories, clear cache for this group
+    if (resultRaw.rows.length === 0) {
+        await client.query('DELETE FROM group_leaderboards WHERE group_id = $1', [groupId]);
+        return;
+    }
+
+    // Prepare data for calculation
+    const groupGeoms = resultRaw.rows.map(row => ({
+        user_id: row.user_id,
+        geom: row.geojson, // GeoJSON string
+        created_at: row.created_at
+    }));
+
+    // Perform Calculation (Painter's Algorithm Logic via SQL is tricky to loop in JS efficiently, 
+    // but the previous query did it in one go. Let's reuse the single SQL approach for efficiency).
+
+    // We run the heavy SQL query ONLY for this group subset
+    const queryLeaderboard = `
+        WITH group_geoms AS (
+            SELECT user_id, geom, created_at 
+            FROM territories 
+            WHERE user_id = ANY($1::text[])
+        )
+        SELECT 
+            t1.user_id,
+            SUM(ST_Area(
+                ST_Difference(
+                    t1.geom, 
+                    COALESCE(
+                        (SELECT ST_Union(t2.geom) 
+                         FROM group_geoms t2 
+                         WHERE t2.created_at > t1.created_at), 
+                        ST_GeomFromText('POLYGON EMPTY', 4326)
+                    )
+                )::geography
+            )) as visible_area_m2
+        FROM group_geoms t1
+        GROUP BY t1.user_id
+    `;
+
+    const resultLeaderboard = await client.query(queryLeaderboard, [memberIds]);
+
+    // Upsert into cache
+    for (const row of resultLeaderboard.rows) {
+        const area = parseFloat(row.visible_area_m2) || 0;
+        await client.query(`
+            INSERT INTO group_leaderboards (group_id, user_id, visible_area_m2, last_updated)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (group_id, user_id) 
+            DO UPDATE SET visible_area_m2 = EXCLUDED.visible_area_m2, last_updated = NOW();
+        `, [groupId, row.user_id, area]);
+    }
+};
 
 // 3. HEALTH CHECK - TEST POSTGRES CONNECTION
 app.get("/health", async (req, res) => {
@@ -521,7 +608,7 @@ app.post("/territories/world/list", async (req, res) => {
 // 5. CONTEXTUAL TERRITORIES (GROUPS)
 app.post("/territories/context", async (req, res) => {
     try {
-        const { userIds } = req.body;
+        const { userIds, groupId } = req.body;
         if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
             return res.json({ ok: true, territories: [], leaderboard: [] });
         }
@@ -533,8 +620,8 @@ app.post("/territories/context", async (req, res) => {
 
         const client = await pool.connect();
         try {
-            // 1. FETCH RAW GEOMETRIES
-            // We fetch the "Personal" territories (Maximal) for everyone in the group
+            // 1. FETCH RAW GEOMETRIES (Always needed for map display)
+            // Flatten simplified
             const queryRaw = `
                 SELECT 
                     id, 
@@ -545,8 +632,6 @@ app.post("/territories/context", async (req, res) => {
                 WHERE user_id = ANY($1::text[])
                 ORDER BY created_at ASC
             `;
-            // Note: simple sorting by CreatedAt ASC for Painter's Algorithm (Oldest first, Newest draws on top)
-
             const resultRaw = await client.query(queryRaw, [userIds]);
 
             const territories = resultRaw.rows.map(row => ({
@@ -556,40 +641,59 @@ app.post("/territories/context", async (req, res) => {
                 createdAt: row.created_at
             }));
 
-            // 2. CALCULATE LEADERBOARD (Who actually owns what visible area?)
-            // Logic: Your area is Your_Poly MINUS Union(All_Newer_Polys)
-            // This is heavy, so we limit group size or optimize later.
+            // 2. FETCH LEADERBOARD
+            let leaderboard = [];
 
-            const queryLeaderboard = `
-                WITH group_geoms AS (
-                    SELECT user_id, geom, created_at 
-                    FROM territories 
-                    WHERE user_id = ANY($1::text[])
-                )
-                SELECT 
-                    t1.user_id,
-                    SUM(ST_Area(
-                        ST_Difference(
-                            t1.geom, 
-                            COALESCE(
-                                (SELECT ST_Union(t2.geom) 
-                                 FROM group_geoms t2 
-                                 WHERE t2.created_at > t1.created_at), 
-                                ST_GeomFromText('POLYGON EMPTY', 4326)
-                            )
-                        )::geography
-                    )) as visible_area_m2
-                FROM group_geoms t1
-                GROUP BY t1.user_id
-                ORDER BY visible_area_m2 DESC
-            `;
+            if (groupId) {
+                // CACHED PATH (For Groups)
+                console.log(`Fetching cached leaderboard for Group: ${groupId}`);
+                const queryCache = `
+                    SELECT user_id, visible_area_m2 
+                    FROM group_leaderboards 
+                    WHERE group_id = $1
+                    ORDER BY visible_area_m2 DESC
+                `;
+                const resultCache = await client.query(queryCache, [groupId]);
 
-            const resultLeaderboard = await client.query(queryLeaderboard, [userIds]);
+                leaderboard = resultCache.rows.map(row => ({
+                    userId: row.user_id,
+                    area: parseFloat(row.visible_area_m2) || 0
+                }));
 
-            const leaderboard = resultLeaderboard.rows.map(row => ({
-                userId: row.user_id,
-                area: parseFloat(row.visible_area_m2) || 0
-            }));
+                // Fallback: If cache is empty but we have territories, maybe trigger a recalc? 
+                // For now, trust the write-path to populate it.
+            } else {
+                // DYNAMIC PATH (For Turf War / Friends logic where no fixed Group ID exists)
+                // We keep the heavy logic but with Simplify optimization to reduce costs
+                const queryLeaderboard = `
+                    WITH group_geoms AS (
+                        SELECT user_id, ST_Simplify(geom, 0.0001) as geom, created_at 
+                        FROM territories 
+                        WHERE user_id = ANY($1::text[])
+                    )
+                    SELECT 
+                        t1.user_id,
+                        SUM(ST_Area(
+                            ST_Difference(
+                                t1.geom, 
+                                COALESCE(
+                                    (SELECT ST_Union(t2.geom) 
+                                     FROM group_geoms t2 
+                                     WHERE t2.created_at > t1.created_at), 
+                                    ST_GeomFromText('POLYGON EMPTY', 4326)
+                                )
+                            )::geography
+                        )) as visible_area_m2
+                    FROM group_geoms t1
+                    GROUP BY t1.user_id
+                    ORDER BY visible_area_m2 DESC
+                `;
+                const resultLeaderboard = await client.query(queryLeaderboard, [userIds]);
+                leaderboard = resultLeaderboard.rows.map(row => ({
+                    userId: row.user_id,
+                    area: parseFloat(row.visible_area_m2) || 0
+                }));
+            }
 
             return res.json({
                 ok: true,

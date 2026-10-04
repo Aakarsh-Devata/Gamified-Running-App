@@ -1,5 +1,6 @@
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:google_sign_in/google_sign_in.dart';
 import '../services/firebase_service.dart';
 import '../services/user_service.dart';
 
@@ -37,7 +38,15 @@ class AuthProvider with ChangeNotifier {
       final profile = await UserService.getUserProfile(user.uid);
       if (profile == null) {
         await UserService.createUserProfile(user.uid);
-        _setupComplete = false;
+        if (user.displayName != null && user.displayName!.isNotEmpty) {
+          await UserService.updateUserProfile(user.uid, {
+            'displayName': user.displayName,
+            'setupComplete': true,
+          });
+          _setupComplete = true;
+        } else {
+          _setupComplete = false;
+        }
       } else {
         _setupComplete = profile.setupComplete ?? false;
       }
@@ -59,6 +68,32 @@ class AuthProvider with ChangeNotifier {
       await FirebaseAuth.instance.signInAnonymously();
     } catch (e) {
       print('Error signing in anonymously: $e');
+      _isSigningIn = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> signInWithGoogle() async {
+    if (_isSigningIn) return;
+    _isSigningIn = true;
+    notifyListeners();
+
+    try {
+      final googleSignIn = GoogleSignIn();
+      final googleUser = await googleSignIn.signIn();
+      if (googleUser != null) {
+        final googleAuth = await googleUser.authentication;
+        if (googleAuth.accessToken != null && googleAuth.idToken != null) {
+          final credential = GoogleAuthProvider.credential(
+            accessToken: googleAuth.accessToken,
+            idToken: googleAuth.idToken,
+          );
+          await FirebaseAuth.instance.signInWithCredential(credential);
+        }
+      }
+    } catch (e) {
+      print('Error signing in with Google: $e');
+    } finally {
       _isSigningIn = false;
       notifyListeners();
     }

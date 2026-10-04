@@ -72,7 +72,7 @@ class _TerritoryScreenState extends State<TerritoryScreen> with SingleTickerProv
       final group = _userGroups.firstWhere((g) => g['id'] == _selectedContextId, orElse: () => {});
       if (group.isNotEmpty) {
         final memberIds = List<String>.from(group['members'] ?? []);
-        final result = await TerritoryService.fetchContextTerritories(memberIds);
+        final result = await TerritoryService.fetchContextTerritories(memberIds, groupId: group['id']);
         if (result != null) {
           territories = List<Map<String, dynamic>>.from(result['territories']);
           leaderboardData = List<Map<String, dynamic>>.from(result['leaderboard']);
